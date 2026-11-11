@@ -1,0 +1,19 @@
+[tools]
+java = "8"
+
+[tasks.check]
+run = "git diff --check"
+
+[tasks.build]
+run = "./gradlew build"
+
+[tasks.test]
+run = "./gradlew test"
+
+[tasks."extras:simpletask-key:build"]
+run = "./gradlew build"
+dir = "extras/simpletask-key"
+
+[tasks."extras:simpletask-key:test"]
+run = "./gradlew test"
+dir = "extras/simpletask-key"
