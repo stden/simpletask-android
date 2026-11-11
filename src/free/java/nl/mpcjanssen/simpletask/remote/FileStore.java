@@ -6,40 +6,36 @@ import android.app.Dialog;
 import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.os.AsyncTask;
+import android.os.Environment;
 import android.support.v4.content.LocalBroadcastManager;
 import android.util.Log;
 import android.widget.Toast;
 
-import com.dropbox.sync.android.DbxAccountManager;
-import com.dropbox.sync.android.DbxException;
-import com.dropbox.sync.android.DbxFile;
-import com.dropbox.sync.android.DbxFileInfo;
-import com.dropbox.sync.android.DbxFileStatus;
-import com.dropbox.sync.android.DbxFileSystem;
-import com.dropbox.sync.android.DbxPath;
-import com.dropbox.sync.android.DbxSyncStatus;
-import com.google.common.io.CharStreams;
-
-import com.google.common.io.LineProcessor;
+import com.dropbox.client2.DropboxAPI;
+import com.dropbox.client2.RESTUtility;
+import com.dropbox.client2.android.AndroidAuthSession;
+import com.dropbox.client2.exception.DropboxException;
+import com.dropbox.client2.jsonextract.JsonExtractionException;
+import com.dropbox.client2.jsonextract.JsonMap;
+import com.dropbox.client2.jsonextract.JsonThing;
+import com.dropbox.client2.session.AppKeyPair;
 import nl.mpcjanssen.simpletask.task.Task;
 import nl.mpcjanssen.simpletask.task.TaskCache;
-import nl.mpcjanssen.simpletask.util.TaskIo;
+import nl.mpcjanssen.simpletask.util.Util;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.*;
-import java.nio.charset.Charset;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
 
 import nl.mpcjanssen.simpletask.Constants;
 import nl.mpcjanssen.simpletask.R;
-import nl.mpcjanssen.simpletask.TodoException;
+import nl.mpcjanssen.simpletask.SimpletaskException;
 import nl.mpcjanssen.simpletask.util.ListenerList;
 import nl.mpcjanssen.simpletask.util.Strings;
-import nl.mpcjanssen.simpletask.util.Util;
 
 /**
  * FileStore implementation backed by Dropbox
@@ -47,59 +43,39 @@ import nl.mpcjanssen.simpletask.util.Util;
 public class FileStore implements FileStoreInterface {
 
     private final String TAG = getClass().getName();
+    private final SharedPreferences mPrefs;
     private String mEol;
-    @Nullable
-    private DbxFile.Listener m_observer;
-    private DbxAccountManager mDbxAcctMgr;
+    private DropboxAPI<AndroidAuthSession> mDBApi;
+
     private Context mCtx;
-    DbxFile mWatchedFile;
-
-
-    private DbxFileSystem mDbxFs;
-    @Nullable
-    private DbxFileSystem.SyncStatusListener m_syncstatus;
-
-    private DbxFileSystem.PathListener mPathListener;
+    private String mWatchedFile;
+    private String latestCursor;
+    private AsyncTask<Void, Void, Void> pollingTask;
 
     public FileStore( Context ctx, String eol) {
+        mPrefs = ctx.getSharedPreferences("filestore", Context.MODE_PRIVATE);
         mCtx = ctx;
         mEol = eol;
-        setDbxAcctMgr();
+        setDbxAPI();
     }
 
-    private void setDbxAcctMgr () {
-        if (mDbxAcctMgr==null) {
-            String app_secret = mCtx.getString(R.string.dropbox_consumer_secret);
-            String app_key = mCtx.getString(R.string.dropbox_consumer_key);
-            app_key = app_key.replaceFirst("^db-","");
-            mDbxAcctMgr = DbxAccountManager.getInstance(mCtx, app_key, app_secret);
-        }
-    }
-
-    @Nullable
-    private DbxFileSystem getDbxFS () {
-        if (mDbxFs!=null) {
-            return mDbxFs;
-        }
-        if (isAuthenticated()) {
-            try {
-                this.mDbxFs = DbxFileSystem.forAccount(mDbxAcctMgr.getLinkedAccount());
-                return mDbxFs;
-            } catch (IOException e) {
-                e.printStackTrace();
-                throw new TodoException("Dropbox", e);
-            }
-        }
-        return null;
-    }
-    @NotNull
-    static public String getDefaultPath() {
+    public static String getDefaultPath() {
         return "/todo/todo.txt";
     }
 
+    private void setDbxAPI () {
+        String app_secret = mCtx.getString(R.string.dropbox_consumer_secret);
+        String app_key = mCtx.getString(R.string.dropbox_consumer_key).replace("db-", "");
+        String savedAuth = mPrefs.getString("token", null);
+        AppKeyPair appKeys = new AppKeyPair(app_key, app_secret);
+        AndroidAuthSession session = new AndroidAuthSession(appKeys, savedAuth);
+        mDBApi = new DropboxAPI<AndroidAuthSession>(session);
+    }
+
+
     @Override
     public boolean isAuthenticated() {
-        return mDbxAcctMgr != null && mDbxAcctMgr.hasLinkedAccount();
+        return mDBApi.getSession().isLinked();
     }
 
     @Override
@@ -111,116 +87,119 @@ public class FileStore implements FileStoreInterface {
             @Override
             protected Void doInBackground(String... params) {
                 Log.v(TAG, "Loading file in background");
-                try {
-                    LocalBroadcastManager.getInstance(mCtx).sendBroadcast(new Intent(Constants.BROADCAST_SYNC_START));
-                    final DbxFileSystem fs = getDbxFS();
-                    if (fs==null) {
-                        return null;
-                    }
-                    fs.syncNowAndWait();
-                    DbxFile openFile = openDbFile(path);
-                    if (openFile == null) {
-                        return null;
-                    }
-
-                    Log.v(TAG, "Opening file " + path + " sync states latest?: " + openFile.getSyncStatus().isLatest);
-                    int times = 0;
-                    try {
-                        if (!openFile.getSyncStatus().isLatest) {
-                            while (openFile.getNewerStatus().pending!= DbxFileStatus.PendingOperation.NONE && times < 30) {
-                                long total = openFile.getNewerStatus().bytesTotal;
-                                long transferred = openFile.getNewerStatus().bytesTransferred;
-                                Log.v(TAG, "Downloading: " + openFile.getPath().getName() + " " + transferred +"/" + total );
-                                Thread.sleep(1000);
-                                times++;
-                            }
-                        }
-                    } catch (InterruptedException e) {
-                        e.printStackTrace();
-                    }
-                    openFile.update();
-                    FileInputStream stream = openFile.getReadStream();
-                    BufferedReader reader = new BufferedReader(new InputStreamReader(stream, "UTF-8"));
-                    taskCache.startLoading();
-                    int i = 0;
-                    String line;
-                    while ((line =  reader.readLine())!=null) {
-                        taskCache.load(new Task(i, line));
-                        i++;
-                    }
-                    openFile.close();
-                    taskCache.endLoading();
-                    startWatching(path);
-                    LocalBroadcastManager.getInstance(mCtx).sendBroadcast(new Intent(Constants.BROADCAST_SYNC_DONE));
-                    LocalBroadcastManager.getInstance(mCtx).sendBroadcast(new Intent(Constants.BROADCAST_UPDATE_UI));
-                } catch ( DbxException e ) {
-                    Log.e(TAG, "Load from file failed: " + e.getCause());
-                    e.printStackTrace();
-
-                } catch (IOException e) {
-                    e.printStackTrace();
+                LocalBroadcastManager.getInstance(mCtx).sendBroadcast(new Intent(Constants.BROADCAST_SYNC_START));
+                taskCache.startLoading();
+                int i = 0;
+                for (String line : readFile(path).split("\r\n|\r|\n")) {
+                    taskCache.load(new Task(i, line));
+                    i++;
                 }
+                taskCache.endLoading();
+                startWatching(path);
                 LocalBroadcastManager.getInstance(mCtx).sendBroadcast(new Intent(Constants.BROADCAST_SYNC_DONE));
+                LocalBroadcastManager.getInstance(mCtx).sendBroadcast(new Intent(Constants.BROADCAST_UPDATE_UI));
                 return null;
             }
         }.execute(path);
 
     }
 
-    @Nullable
-    private DbxFile openDbFile(String path) throws DbxException {
-        DbxFileSystem fs = getDbxFS();
-        if (fs == null) {
-            return null;
-        }
-        DbxPath dbPath = new DbxPath(path);
-        if (fs.exists(dbPath)) {
-            return fs.open(dbPath);
-        } else {
-            return fs.create(dbPath);
-        }
-    }
 
     @Override
     public void startLogin(Activity caller, int i) {
-        mDbxAcctMgr.startLink(caller, 0);
+        // MyActivity below should be your activity class name
+        mDBApi.getSession().startOAuth2Authentication(caller);
+    }
+
+    @Override
+    public void finishLogin() {
+        if (mDBApi.getSession().authenticationSuccessful()) {
+            try {
+                // Required to complete auth, sets the access token on the session
+                mDBApi.getSession().finishAuthentication();
+
+                String accessToken = mDBApi.getSession().getOAuth2AccessToken();
+                mPrefs.edit().putString("token", accessToken).apply();
+            } catch (IllegalStateException e) {
+                Log.i("DbAuthLog", "Error authenticating", e);
+            }
+        }
     }
 
     private void startWatching(final String path) {
-        if (isAuthenticated() && getDbxFS() != null) {
-            mPathListener = new DbxFileSystem.PathListener() {
-                @Override
-                public void onPathChange(DbxFileSystem dbxFileSystem, DbxPath dbxPath, Mode mode) {
-                    try {
-                        DbxFile changedFile = dbxFileSystem.open(dbxPath);
-                        DbxFileStatus changedFileStatus = changedFile.getNewerStatus();
-                        changedFile.close();
-                        if (changedFileStatus==null) {
-                            Log.v(TAG, "File changed " + dbxPath.getName() + " but newerStatus == null, not refreshing");
-                        } else {
-                            Log.v(TAG, "File changed " + dbxPath.getName() + " synced: " + changedFileStatus.isCached);
-                            LocalBroadcastManager.getInstance(mCtx).sendBroadcast(new Intent(Constants.BROADCAST_FILE_CHANGED));
-                        }
-                    } catch (DbxException e) {
-                        e.printStackTrace();
-                    }
-                }
-            };
-            mDbxFs.addPathListener(mPathListener, new DbxPath(path), DbxFileSystem.PathListener.Mode.PATH_ONLY);
+        mWatchedFile = path;
+        if (pollingTask == null) {
+            Log.v(TAG, "Initializing slow polling thread");
+            try {
+                Log.v(TAG, "Finding latest cursor");
+                ArrayList<String> params = new ArrayList<>();
+                params.add("include_media_info");
+                params.add("false");
+                Object response = RESTUtility.request(RESTUtility.RequestMethod.POST, "api.dropbox.com", "delta/latest_cursor", 1, params.toArray(new String[0]), mDBApi.getSession());
+                Log.v(TAG, "Longpoll latestcursor response: " + response.toString());
+                JsonThing result = new JsonThing(response);
+                JsonMap resultMap = result.expectMap();
+                latestCursor = resultMap.get("cursor").expectString();
+            } catch (DropboxException e) {
+                e.printStackTrace();
+                latestCursor = null;
+            } catch (JsonExtractionException e) {
+                latestCursor = null;
+                e.printStackTrace();
+            }
+            startLongPoll();
         }
     }
 
-    private void stopWatching(String path) {
 
-        if (getDbxFS()==null || mPathListener == null) {
-            return;
-        }
-        mDbxFs.removePathListener(mPathListener,new DbxPath(path), DbxFileSystem.PathListener.Mode.PATH_ONLY);
+    private void startLongPoll ()  {
+        pollingTask = new AsyncTask<Void,Void,Void>() {
+            @Override
+            protected Void doInBackground(Void... v) {
+                try {
+                    Log.v(TAG, "Long polling");
+                    ArrayList<String> params = new ArrayList<>();
+                    params.add("cursor");
+                    params.add(latestCursor);
+                    params.add("timeout");
+                    params.add("120");
+                    Object response = RESTUtility.request(RESTUtility.RequestMethod.GET, "api-notify.dropbox.com", "longpoll_delta", 1, params.toArray(new String[0]), mDBApi.getSession());
+                    Log.v(TAG, "Longpoll response: " + response.toString());
+                    JsonThing result = new JsonThing(response);
+                    JsonMap resultMap = result.expectMap();
+                    boolean changes = resultMap.get("changes").expectBoolean();
+                    JsonThing backoff =  resultMap.getOrNull("backoff");
+                    Log.v(TAG, "Longpoll ended, changes " + changes + " backoff " + backoff);
+                    if (changes) {
+                        DropboxAPI.DeltaPage<DropboxAPI.Entry> delta = mDBApi.delta(latestCursor);
+                        latestCursor = delta.cursor;
+                        for (DropboxAPI.DeltaEntry entry : delta.entries) {
+                            if (entry.lcPath.equalsIgnoreCase(mWatchedFile)) {
+                                Log.v (TAG, "File " + mWatchedFile + " changed, reloading");
+                                LocalBroadcastManager.getInstance(mCtx).sendBroadcast(new Intent(Constants.BROADCAST_FILE_CHANGED));
+                                return null;
+                            }
+                        }
+                    }
+                } catch (DropboxException e) {
+                    e.printStackTrace();
+                } catch (JsonExtractionException e) {
+                    e.printStackTrace();
+                }
+                return null;
+            }
+            @Override
+            protected void onPostExecute(Void v) {
+                startLongPoll();
+            }
+        }.execute();
     }
 
     @Override
     public void deauthenticate() {
-        mDbxAcctMgr.unlink();
+        mDBApi.getSession().unlink();
+        mPrefs.edit().remove("token").commit();
+        mDBApi = null;
     }
 
     @Override
@@ -232,26 +211,13 @@ public class FileStore implements FileStoreInterface {
 
     @Override
     public void saveTasksToFile(String path, TaskCache taskCache) {
-        try {
-            LocalBroadcastManager.getInstance(mCtx).sendBroadcast(new Intent(Constants.BROADCAST_SYNC_START));
-            stopWatching(path);
-            DbxFile outFile = openDbFile(path);
-            outFile.writeString(Util.joinTasks(taskCache.getTasks(), mEol));
-            outFile.close();
-            startWatching(path);
-        } catch (DbxException e) {
-            e.printStackTrace();
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
+        LocalBroadcastManager.getInstance(mCtx).sendBroadcast(new Intent(Constants.BROADCAST_SYNC_START));
         LocalBroadcastManager.getInstance(mCtx).sendBroadcast(new Intent(Constants.BROADCAST_SYNC_DONE));
     }
 
     @Override
     public void appendTaskToFile(String path, List<Task> tasks) throws IOException {
-        DbxFile outFile = openDbFile(path);
-        outFile.appendString(Util.joinTasks(tasks, mEol));
-        outFile.close();
+        throw new SimpletaskException("append not implemented");
     }
 
 
@@ -266,29 +232,22 @@ public class FileStore implements FileStoreInterface {
     }
 
     @Override
-    public String readFile(String file) {
-        if (file==null) {
+    public String readFile(String fileName) {
+        if (fileName==null) {
             return "";
         }
         try {
-            DbxFile openFile = mDbxFs.open(new DbxPath(file));
-            int times = 0;
-            while ( openFile.getSyncStatus()!=null &&
-                    !openFile.getSyncStatus().isLatest &&
-                    times < 30) {
-                Log.v(TAG, "Sleeping for 1000ms, sync states latest?: " + openFile.getSyncStatus().isLatest);
-                Thread.sleep(1000);
-                times++;
-            }
-            openFile.update();
-            String result =  openFile.readString();
-            openFile.close();
-            return result;
-        } catch (DbxException e) {
+            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+            DropboxAPI.DropboxFileInfo info = mDBApi.getFile(fileName, null, outputStream, null);
+            Log.i(TAG, "The " + fileName + " file's rev is: " + info.getMetadata().rev);
+            String contents = outputStream.toString("UTF-8");
+            outputStream.close();
+            return contents;
+        } catch (DropboxException e) {
+            e.printStackTrace();
+        } catch (UnsupportedEncodingException e) {
             e.printStackTrace();
         } catch (IOException e) {
-            e.printStackTrace();
-        } catch (InterruptedException e) {
             e.printStackTrace();
         }
         return "";
@@ -304,65 +263,81 @@ public class FileStore implements FileStoreInterface {
         return Constants.STORE_DROPBOX;
     }
 
+
     public static class FileDialog {
         private static final String PARENT_DIR = "..";
         private String[] fileList;
-        private DbxPath currentPath;
+        private HashMap<String,DropboxAPI.Entry> entryHash = new HashMap<>();
+        private File currentPath;
 
-        @NotNull
         private ListenerList<FileSelectedListener> fileListenerList = new ListenerList<FileSelectedListener>();
         private final Activity activity;
+        private boolean txtOnly;
+        Dialog dialog;
 
         /**
-         * @param activity  Activity to display the file dialog
-         * @param path      File path to start the dialog at
-         * @param txtOnly   Show only txt files. Not used for Dropbox
+         * @param activity
+         * @param pathName
          */
-        public FileDialog(Activity activity, @NotNull String path, boolean txtOnly ) {
+        public FileDialog(Activity activity, String pathName, boolean txtOnly) {
             this.activity = activity;
-            this.currentPath = new DbxPath(path);
+            this.txtOnly=txtOnly;
+            currentPath = new File(pathName);
+
         }
 
         /**
-         * @return file dialog
+         *
          */
-        @Nullable
-        public Dialog createFileDialog(final Context ctx, final FileStoreInterface fileStore) {
-            final DbxFileSystem fs = ((FileStore)fileStore).getDbxFS();
-            if (fs==null) {
-                return null;
-            }
-            Dialog dialog;
-            AlertDialog.Builder builder = new AlertDialog.Builder(activity);
-            String title = currentPath.getName();
-            if (Strings.isEmptyOrNull(title)) {
-                title = "/";
-            }
-            loadFileList(fs,currentPath);
-            if (fileList==null) {
-                Toast.makeText(ctx,"Awaiting first Dropbox Sync", Toast.LENGTH_LONG).show();
-                return null;
-            }
-            builder.setTitle(title);
+        public void createFileDialog(final Context ctx, final FileStoreInterface fs) {
 
-            builder.setItems(fileList, new DialogInterface.OnClickListener() {
-                public void onClick(@NotNull DialogInterface dialog, int which) {
-                    String fileChosen = fileList[which];
-                    DbxPath chosenFile = getChosenFile(fileChosen);
-                    try {
-                        if (fs.getFileInfo(chosenFile).isFolder) {
-                            loadFileList(fs, chosenFile);
-                            dialog.cancel();
-                            dialog.dismiss();
-                            showDialog(ctx,fileStore);
-                        } else fireFileSelectedEvent(chosenFile);
-                    } catch (DbxException e) {
-                        e.printStackTrace();
-                    }
+            final DropboxAPI<AndroidAuthSession> api = ((FileStore)fs).mDBApi;
+            if (api==null) {
+                return;
+            }
+            new AsyncTask<Void,Void, AlertDialog.Builder>() {
+
+                @Override
+                protected AlertDialog.Builder doInBackground(Void... params) {
+                    loadFileList(api, currentPath);
+                    AlertDialog.Builder builder = new AlertDialog.Builder(activity);
+                    builder.setTitle(currentPath.getPath());
+
+                    builder.setItems(fileList, new DialogInterface.OnClickListener() {
+                        public void onClick(DialogInterface dialog, int which) {
+                            String fileChosen = fileList[which];
+                            if (fileChosen.equals(PARENT_DIR)) {
+                                currentPath = new File(currentPath.getParent());
+                                createFileDialog(ctx, fs);
+                                return;
+                            }
+                            File chosenFile = getChosenFile(fileChosen);
+                            Log.w("FileStore", "Selected file " + chosenFile.getName());
+                            DropboxAPI.Entry entry = entryHash.get(fileChosen);
+                            if (entry.isDir) {
+                                currentPath = chosenFile;
+                                createFileDialog(ctx, fs);
+                            } else {
+                                dialog.cancel();
+                                dialog.dismiss();
+                                fireFileSelectedEvent(chosenFile);
+                            }
+                        }
+                    });
+                    return builder;
                 }
-            });
-            dialog = builder.show();
-            return dialog;
+
+                @Override
+                protected void onPostExecute(AlertDialog.Builder builder) {
+                    if (dialog!=null) {
+                        dialog.cancel();
+                        dialog.dismiss();
+                    }
+                    dialog = builder.create();
+                    dialog.show();
+                }
+
+            }.execute();
         }
 
 
@@ -370,69 +345,68 @@ public class FileStore implements FileStoreInterface {
             fileListenerList.add(listener);
         }
 
-        /**
-         * Show file dialog
-         */
-        public void showDialog(Context ctx, FileStoreInterface fs) {
-            Dialog d = createFileDialog(ctx, fs);
-            if(d!=null && !this.activity.isFinishing()) {
-                d.show();
-            }
-        }
 
-        private void fireFileSelectedEvent(@NotNull final DbxPath file) {
+        private void fireFileSelectedEvent(final File file) {
             fileListenerList.fireEvent(new ListenerList.FireHandler<FileSelectedListener>() {
-                public void fireEvent(@NotNull FileSelectedListener listener) {
+                public void fireEvent(FileSelectedListener listener) {
                     listener.fileSelected(file.toString());
                 }
             });
         }
 
-        private void loadFileList(DbxFileSystem fs, DbxPath path) {
+        private DropboxAPI.Entry getPathMetaData(DropboxAPI api, File path) throws DropboxException {
+            if (api!=null) {
+                return api.metadata(path.toString(), 0, null, true, null);
+            } else {
+                return null;
+            }
+        }
+
+        private void loadFileList(DropboxAPI<AndroidAuthSession> api, File path) {
+            if (path==null) {
+                path = new File("/");
+            }
             this.currentPath = path;
             List<String> f = new ArrayList<String>();
             List<String> d = new ArrayList<String>();
-            if (path != DbxPath.ROOT) d.add(PARENT_DIR);
 
             try {
-                if (!fs.hasSynced()) {
-                    fileList = null ;
-                    return;
-                } else {
-                    for (DbxFileInfo fInfo : fs.listFolder(path)) {
-                        if (fInfo.isFolder) {
-                            d.add(fInfo.path.getName());
-                        } else {
-                            f.add(fInfo.path.getName());
-                        }
-                    }
+                DropboxAPI.Entry entries = getPathMetaData(api,path) ;
+                entryHash.clear();
+                if (!entries.isDir) return;
+                if (!path.toString().equals("/")) {
+                    d.add(PARENT_DIR);
                 }
-            } catch (DbxException e) {
-                e.printStackTrace();
+                for (DropboxAPI.Entry entry : entries.contents) {
+                    if (entry.isDeleted) continue;
+                    if (entry.isDir) {
+                        d.add(entry.fileName());
+                    } else {
+                        f.add(entry.fileName());
+                    }
+                    entryHash.put(entry.fileName(), entry);
+                }
+            } catch (DropboxException e) {
+                Log.w("FileStore", "Couldn't load list from " + path.getName() + " loading root instead.");
+                loadFileList(api, null);
+                return;
             }
-
             Collections.sort(d);
             Collections.sort(f);
             d.addAll(f);
             fileList = d.toArray(new String[d.size()]);
         }
 
-        private DbxPath getChosenFile(@NotNull String fileChosen) {
-            if (fileChosen.equals(PARENT_DIR)) return currentPath.getParent();
-            else return new DbxPath(currentPath, fileChosen);
+        private File getChosenFile(String fileChosen) {
+            if (fileChosen.equals(PARENT_DIR)) return currentPath.getParentFile();
+            else return new File(currentPath, fileChosen);
         }
     }
 
+
+
     @Override
     public boolean initialSyncDone() {
-        if (mDbxFs!=null) {
-            try {
-                return mDbxFs.hasSynced();
-            } catch (DbxException e) {
-                e.printStackTrace();
-                return false;
-            }
-        }
-        return false;
+        return true;
     }
 }
